@@ -1,0 +1,169 @@
+#!/bin/bash
+
+# Detect public IP
+echo "Detecting public IP address..."
+PUBLIC_IP=$(curl -s https://api.ipify.org)
+echo "Public IP: $PUBLIC_IP"
+
+# Detect internal IPs
+echo "Detecting internal IP addresses..."
+INTERNAL_IPS=($(hostname -I))
+echo -e "Internal IPs:"
+for ip in "${INTERNAL_IPS[@]}"; do
+  echo "- $ip"
+done
+
+# Initialize IP_LIST with public IP
+IP_LIST=("$PUBLIC_IP")
+
+# Add all internal IPs to the list
+for ip in "${INTERNAL_IPS[@]}"; do
+  IP_LIST+=("$ip")
+done
+
+# Ask for additional IPs (for VPN or other networks)
+echo -e "\nAdditional IPs"
+echo "Enter any additional IP addresses (like VPN IPs) that clients might use to access your service."
+echo "Press Enter on a blank line when finished."
+
+while true; do
+  read -p "Additional IP (or press Enter to finish): " ADDITIONAL_IP
+  if [ -z "$ADDITIONAL_IP" ]; then
+    break
+  fi
+  IP_LIST+=("$ADDITIONAL_IP")
+done
+
+# Show all IPs to be included in the certificate
+echo -e "\n=== IP Addresses in Certificate ==="
+echo "The following IP addresses will be included in the certificate:"
+for i in "${!IP_LIST[@]}"; do
+  echo "$((i+1)). ${IP_LIST[$i]}"
+done
+echo "==============================="
+
+# Prompt for certificate validity
+read -p "Enter certificate validity in days [365]: " CERT_VALIDITY_INPUT
+CERT_VALIDITY_DAYS=${CERT_VALIDITY_INPUT:-365}
+
+# Prompt for file names or use defaults
+read -p "Enter private key filename [server.key]: " KEY_INPUT
+KEY_FILE=${KEY_INPUT:-server.key}
+
+read -p "Enter certificate filename [server.crt]: " CERT_INPUT
+CERT_FILE=${CERT_INPUT:-server.crt}
+
+# Check if private key exists and back it up if necessary
+if [[ -f "$KEY_FILE" ]]; then
+  echo "⚠️ Warning: Private key $KEY_FILE already exists. Backing up as $KEY_FILE.bak"
+  mv "$KEY_FILE" "$KEY_FILE.bak"
+fi
+
+# Generate new private key
+echo -e "\nGenerating private key..."
+openssl genrsa -out "$KEY_FILE" 2048
+if [[ $? -ne 0 ]]; then
+  echo "❌ Error generating private key!"
+  exit 1
+fi
+
+# Ensure the private key format is correct
+echo -e "\nVerifying private key format..."
+openssl rsa -check -noout -in "$KEY_FILE"
+if [[ $? -ne 0 ]]; then
+  echo "❌ Invalid private key format! Exiting..."
+  exit 1
+fi
+
+# Generate CSR (Certificate Signing Request)
+CSR_FILE="temp_$(date +%s).csr"
+CONFIG_FILE="temp_$(date +%s).cnf"
+
+# Prompt for certificate details
+read -p "Enter Country Name (2 letter code) [US]: " COUNTRY
+COUNTRY=${COUNTRY:-US}
+
+read -p "Enter State or Province [State]: " STATE
+STATE=${STATE:-State}
+
+read -p "Enter City or Locality [City]: " CITY
+CITY=${CITY:-City}
+
+read -p "Enter Organization Name [Organization]: " ORG
+ORG=${ORG:-Organization}
+
+# Create the alt_names section for the config file
+ALT_NAMES=""
+for i in "${!IP_LIST[@]}"; do
+  ALT_NAMES+="IP.$((i+1)) = ${IP_LIST[$i]}"$'\n'
+done
+
+# Create OpenSSL config file with Subject Alternative Names for all IPs
+cat > "$CONFIG_FILE" << EOF
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+C = $COUNTRY
+ST = $STATE
+L = $CITY
+O = $ORG
+CN = ${IP_LIST[0]}
+
+[v3_req]
+keyUsage = keyEncipherment, dataEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+
+[alt_names]
+$ALT_NAMES
+EOF
+
+echo -e "\nCreating certificate signing request..."
+openssl req -new -key "$KEY_FILE" -out "$CSR_FILE" -config "$CONFIG_FILE"
+if [[ $? -ne 0 ]]; then
+  echo "❌ Error creating CSR!"
+  exit 1
+fi
+
+echo -e "\nGenerating self-signed certificate..."
+openssl x509 -req -days "$CERT_VALIDITY_DAYS" -in "$CSR_FILE" -signkey "$KEY_FILE" -out "$CERT_FILE" \
+  -extensions v3_req -extfile "$CONFIG_FILE"
+if [[ $? -ne 0 ]]; then
+  echo "❌ Error generating self-signed certificate!"
+  exit 1
+fi
+
+# Ensure the certificate matches the private key
+echo -e "\nVerifying certificate matches the private key..."
+openssl rsa -noout -modulus -in "$KEY_FILE" | openssl md5 > key_modulus.txt
+openssl x509 -noout -modulus -in "$CERT_FILE" | openssl md5 > cert_modulus.txt
+if ! diff key_modulus.txt cert_modulus.txt > /dev/null; then
+  echo "❌ Error: Certificate does not match private key!"
+  rm key_modulus.txt cert_modulus.txt
+  exit 1
+fi
+rm key_modulus.txt cert_modulus.txt
+
+# Display certificate information
+echo -e "\n✅ Certificate generated successfully!"
+echo -e "\n=== Certificate Details ==="
+openssl x509 -in "$CERT_FILE" -text -noout | grep -A1 "Subject:"
+openssl x509 -in "$CERT_FILE" -text -noout | grep -A1 "Issuer:"
+openssl x509 -in "$CERT_FILE" -text -noout | grep -A2 "Validity"
+
+# Display all IPs in the certificate
+echo -e "\n=== IP Addresses in Certificate ==="
+openssl x509 -in "$CERT_FILE" -text -noout | grep -A20 "Subject Alternative Name" | grep "IP Address"
+echo "==============================="
+
+# Cleanup temporary files
+rm "$CSR_FILE"
+rm "$CONFIG_FILE"
+
+echo -e "\n🔹 Files created:"
+echo "🔑 Private key: $KEY_FILE"
+echo "📜 Certificate: $CERT_FILE"
+echo -e "\n✅ Done!"
